@@ -1,15 +1,13 @@
 //SPDX-License-Identifier: GPL-3.0
 
+import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-pragma solidity 0.8.18;
+pragma solidity ^0.8.17;
 
-/*  @author M. Burke
- *  @notice This is a payment contract that enforces a refund schedule.
- */
-
-contract TimeBasedEscrow {
-    bytes32 public constant MINTER_ROLE = keccak256("WITHDRAWER_ROLE");
+contract Refund is AccessControl {
+    bytes32 public constant WITHDRAWER_ROLE = keccak256("WITHDRAWER_ROLE");
+    uint256 public immutable PERIOD = 15 days;
     IERC20 public immutable USDC;
 
     // Technically, USDC could upgrade and change the decimals, in which
@@ -18,7 +16,16 @@ contract TimeBasedEscrow {
     uint64 public constant USDC_DECIMALS = 10**6;
 
     // These three storage variables all fits in one slot
-    uint8[8] public refundPercentPerMonth = [100, 75, 50, 25, 0, 0, 0, 0];
+    uint8[8] public refundPercentPerPeriod = [
+        100,
+        75,
+        75,
+        50,
+        50,
+        25,
+        25,
+        0
+    ];
 
     // good for until year 36,812
     uint40[4] public validStartTimestamps;
@@ -27,7 +34,7 @@ contract TimeBasedEscrow {
     // Someone else who is
     uint32 public depositedDollars = 0;
 
-    event RefundPercentPerMonthUpdated(uint8[8]);
+    event RefundPercentPerPeriodUpdated(uint8[8]);
     event ValidStartTimestampsUpdated(uint40[4]);
     event SellerTerminateAgreement(address indexed, uint256);
     event BuyerClaimRefundDollars(address indexed, uint256);
@@ -40,26 +47,19 @@ contract TimeBasedEscrow {
         uint32 originalDepositInDollars;
         uint32 balanceInDollars; // this goes down as the seller withdraws
         uint64 cohortStartTimestamp; // When the class starts and the refund counters starts deducting
-        uint8[4] refundPercentPerMonth;
+        uint8[8] refundPercentPerPeriod;
     }
 
     constructor(address _usdc) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(WITHDRAWER_ROLE, msg.sender);
 
         USDC = IERC20(_usdc);
     }
 
-    /*
-    modifier onlyAdmin() {
-        require(_minters.has(msg.sender), "DOES_NOT_HAVE_WITHDRAWER_ROLE");
-        _;
-    }
-    */
-
-    function updateValidStartTimestamps(uint40[4] _validStartTimestamps)
-        external
-        onlyAdmin
-    {
+    function updateValidStartTimestamps(
+        uint40[4] calldata _validStartTimestamps
+    ) external onlyRole(WITHDRAWER_ROLE) {
         emit ValidStartTimestampsUpdated(_validStartTimestamps);
         validStartTimestamps = _validStartTimestamps;
     }
@@ -87,7 +87,6 @@ contract TimeBasedEscrow {
             _cohortStartTimestamp <= uint40(block.timestamp) + uint40(180 days),
             "Date is too far in the future"
         );
-
         require(
             _cohortStartTimestamp == validStartTimestamps[0] ||
                 _cohortStartTimestamp == validStartTimestamps[1] ||
@@ -95,22 +94,21 @@ contract TimeBasedEscrow {
                 _cohortStartTimestamp == validStartTimestamps[3],
             "Invalid start date"
         );
-
         require(_priceInDollars > 0, "User cannot deposit zero dollars.");
         require(
             deposits[msg.sender].originalDepositInDollars == 0,
             "User cannot deposit twice."
         );
-        require(
-            USDC.allowance(msg.sender, address(this)) >= _priceInUSDC,
-            "User must have made allowance via USDC contract."
-        );
+        //require(
+        //    USDC.allowance(msg.sender, address(this)) >= _priceInUSDC,
+        //    "User must have made allowance via USDC contract."
+        //);
 
         deposits[msg.sender] = Deposit({
             originalDepositInDollars: _priceInDollars,
             balanceInDollars: _priceInDollars,
             cohortStartTimestamp: _cohortStartTimestamp,
-            refundPercentPerMonth: refundPercentPerMonth
+            refundPercentPerPeriod: refundPercentPerPeriod
         });
 
         // it's really unlike 4 million dollars will be in the contract.
@@ -140,7 +138,7 @@ contract TimeBasedEscrow {
      *  @param _schedule The percentage at which the escrow unlocks the money for the seller week by week
      */
 
-    function updateRefundPercentPerMonth(uint8[8] calldata _schedule)
+    function updateRefundPercentPerPeriod(uint8[8] calldata _schedule)
         external
         payable
         onlyRole(WITHDRAWER_ROLE)
@@ -163,8 +161,8 @@ contract TimeBasedEscrow {
             }
         }
 
-        emit RefundPercentPerMonthUpdated(_schedule);
-        refundPercentPerMonth = _schedule;
+        emit RefundPercentPerPeriodUpdated(_schedule);
+        refundPercentPerPeriod = _schedule;
     }
 
     /*  @dev Push payment to user and removal of 'account'
@@ -178,11 +176,15 @@ contract TimeBasedEscrow {
     {
         uint256 _refundInDollars = calculateRefundDollars(_buyer);
 
-        depositedDollars -= uint128(_refundInDollars);
+        uint32 leftOver = deposits[_buyer].balanceInDollars - uint32(_refundInDollars);
+        depositedDollars -= uint32(_refundInDollars);
+        depositedDollars -= leftOver;
+
         delete deposits[_buyer];
 
         emit SellerTerminateAgreement(_buyer, _refundInDollars);
         USDC.transfer(_buyer, _refundInDollars * USDC_DECIMALS);
+        USDC.transfer(msg.sender, leftOver * USDC_DECIMALS);
     }
 
     /*  @dev See calculation to ensure user refund policy is respected.
@@ -190,7 +192,7 @@ contract TimeBasedEscrow {
      *         to withdraw funds from.
      */
 
-    function sellerWithdraw(address[] calldata _buyers)
+    function sellerWithdraw(address[] memory _buyers)
         external
         onlyRole(WITHDRAWER_ROLE)
     {
@@ -225,16 +227,20 @@ contract TimeBasedEscrow {
         returns (uint256)
     {
         uint256 paidDollars = deposits[_buyer].originalDepositInDollars;
-        uint256 scheduleLength = deposits[_buyer].refundPercentPerMonth.length;
+        uint256 scheduleLength = deposits[_buyer]
+            .refundPercentPerPeriod
+            .length;
 
-        uint256 monthsComplete = _getMonthsComplete(_buyer);
+        uint256 periodsComplete = _getPeriodsComplete(_buyer);
         uint256 multiplier;
 
-        if (monthsComplete < scheduleLength) {
-            multiplier = deposits[_buyer].refundPercentPerMonth[monthsComplete];
+        if (periodsComplete < scheduleLength) {
+            multiplier = deposits[_buyer].refundPercentPerPeriod[
+                periodsComplete
+            ];
         }
 
-        if (monthsComplete >= scheduleLength) {
+        if (periodsComplete >= scheduleLength) {
             multiplier = 0;
         }
 
@@ -262,25 +268,24 @@ contract TimeBasedEscrow {
         // Basically, ensuring that the buyer and seller cannot withdraw the cents
         // portion of their part of the deal ensures that neither party underflows
         // and bricks the contract (because Solidity will revert underflow).
-        uint256 amountBuyerCanRefundDollars = calculateRefundDollars(_buyer) +
-            1;
+        uint256 amountBuyerCanRefundDollars = calculateRefundDollars(_buyer) + 1;
         uint256 buyerBalanceInDollars = deposits[_buyer].balanceInDollars;
 
         if (amountBuyerCanRefundDollars >= buyerBalanceInDollars) {
             return 0;
         }
 
-        return buyerBalanceDollars - amountBuyerCanRefundDollars;
+        return buyerBalanceInDollars - amountBuyerCanRefundDollars;
     }
 
     /*  @notice Used internally for calculating where a user is within their
      *          refund schedule.
      *  @param _buyer User wallet address.
-     *  @returns number of months since the start date
+     *  @returns number of periods since the start date
      */
 
-    function _getMonthsComplete(address _buyer)
-        internal
+    function _getPeriodsComplete(address _buyer)
+        public
         view
         returns (uint256)
     {
@@ -291,7 +296,7 @@ contract TimeBasedEscrow {
             return 0;
         }
 
-        return (currentTime - startTime) / uint256(30 days);
+        return (currentTime - startTime) / uint64(PERIOD);
     }
 
     /*  @notice Used to recover ERC20 tokens transfered to contract
@@ -300,7 +305,7 @@ contract TimeBasedEscrow {
      *  @param _amount The value (with correct decimals) to be recovered.
      */
 
-    function rescueERC20Token(IERC20 _tokenContract, _amount)
+    function rescueERC20Token(IERC20 _tokenContract, uint256 _amount)
         external
         onlyRole(WITHDRAWER_ROLE)
     {
@@ -314,13 +319,10 @@ contract TimeBasedEscrow {
          *  amountToWithdraw is calculated.
          */
 
-        uint256 contractBalanceUSDC = USDC.balanceOf(address(this));
+        _tokenContract.transfer(msg.sender, excessUSDC());
+    }
 
-        if (contractBalance > depositedDollars) {
-            uint256 amountToWithdrawUSDC = contractBalanceUSDC -
-                depositedDollars *
-                USDC_DECIMALS;
-            _tokenContract.transfer(msg.sender, amountToWithdrawUSDC);
-        }
+    function excessUSDC() public view returns (uint256 excess) {
+        excess = USDC.balanceOf(address(this)) - depositedDollars * USDC_DECIMALS;
     }
 }
