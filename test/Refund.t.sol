@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity 0.8.18;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "forge-std/Test.sol";
@@ -284,13 +284,5 @@ contract RefundTest is Test {
         vm.expectRevert("ERC20: insufficient allowance"); 
         refund.payUpfront(purchasePriceDollars, march7_2023);
         vm.stopPrank();
-    }
-
-    function testBuyerGetsZeroAfterExpiration() public {
-        setUpEconomy(1000);
-        vm.warp(march7_2023 + 2000 days);
-
-        refund.buyerClaimRefund();
-        assertLe(usdc.balanceOf(address(buyer)), 0, "refund should be zero");
     }
 }

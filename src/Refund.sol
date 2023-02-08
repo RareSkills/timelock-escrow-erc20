@@ -3,7 +3,7 @@
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-pragma solidity ^0.8.17;
+pragma solidity 0.8.18;
 
 contract Refund is AccessControl {
     bytes32 public constant WITHDRAWER_ROLE = keccak256("WITHDRAWER_ROLE");
@@ -99,10 +99,6 @@ contract Refund is AccessControl {
             deposits[msg.sender].originalDepositInDollars == 0,
             "User cannot deposit twice."
         );
-        //require(
-        //    USDC.allowance(msg.sender, address(this)) >= _priceInUSDC,
-        //    "User must have made allowance via USDC contract."
-        //);
 
         deposits[msg.sender] = Deposit({
             originalDepositInDollars: _priceInDollars,
