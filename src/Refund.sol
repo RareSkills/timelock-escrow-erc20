@@ -19,11 +19,11 @@ contract Refund is AccessControl {
     uint8[8] public refundPercentPerPeriod = [
         100,
         75,
-        75,
         50,
         50,
         25,
         25,
+        0,
         0
     ];
 
